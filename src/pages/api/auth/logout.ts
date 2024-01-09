@@ -9,7 +9,7 @@ export default async (req: NextApiRequest, res: NextApiResponse) => {
 
   if (req.method === 'POST') {
     if (redis.enabled) {
-      await redis.del(getAuthToken(req));
+      await redis.client.del(getAuthToken(req));
     }
 
     return ok(res);

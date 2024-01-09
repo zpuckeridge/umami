@@ -1,13 +1,12 @@
-import { Resolver } from 'dns/promises';
 import ipaddr from 'ipaddr.js';
 import isbot from 'isbot';
 import { COLLECTION_TYPE, HOSTNAME_REGEX } from 'lib/constants';
 import { secret } from 'lib/crypto';
-import { getIpAddress, getJsonBody } from 'lib/detect';
+import { getIpAddress } from 'lib/detect';
 import { useCors, useSession, useValidate } from 'lib/middleware';
 import { CollectionType, YupRequest } from 'lib/types';
 import { NextApiRequest, NextApiResponse } from 'next';
-import { badRequest, createToken, forbidden, ok, send } from 'next-basics';
+import { badRequest, createToken, forbidden, methodNotAllowed, ok, send } from 'next-basics';
 import { saveEvent, saveSessionData } from 'queries';
 import * as yup from 'yup';
 
@@ -73,93 +72,84 @@ const schema = {
 export default async (req: NextApiRequestCollect, res: NextApiResponse) => {
   await useCors(req, res);
 
-  if (isbot(req.headers['user-agent']) && !process.env.DISABLE_BOT_CHECK) {
-    return ok(res);
-  }
-
-  const { type, payload } = getJsonBody<CollectRequestBody>(req);
-
-  req.yup = schema;
-  await useValidate(req, res);
-
-  if (await hasBlockedIp(req)) {
-    return forbidden(res);
-  }
-
-  const { url, referrer, name: eventName, data: eventData, title: pageTitle } = payload;
-
-  await useSession(req, res);
-
-  const session = req.session;
-
-  if (type === COLLECTION_TYPE.event) {
-    // eslint-disable-next-line prefer-const
-    let [urlPath, urlQuery] = url?.split('?') || [];
-    let [referrerPath, referrerQuery] = referrer?.split('?') || [];
-    let referrerDomain;
-
-    if (!urlPath) {
-      urlPath = '/';
+  if (req.method === 'POST') {
+    if (!process.env.DISABLE_BOT_CHECK && isbot(req.headers['user-agent'])) {
+      return ok(res);
     }
 
-    if (referrerPath?.startsWith('http')) {
-      const refUrl = new URL(referrer);
-      referrerPath = refUrl.pathname;
-      referrerQuery = refUrl.search.substring(1);
-      referrerDomain = refUrl.hostname.replace(/www\./, '');
+    await useValidate(schema, req, res);
+
+    if (hasBlockedIp(req)) {
+      return forbidden(res);
     }
 
-    if (process.env.REMOVE_TRAILING_SLASH) {
-      urlPath = urlPath.replace(/.+\/$/, '');
+    const { type, payload } = req.body;
+
+    const { url, referrer, name: eventName, data: eventData, title: pageTitle } = payload;
+
+    await useSession(req, res);
+
+    const session = req.session;
+
+    if (type === COLLECTION_TYPE.event) {
+      // eslint-disable-next-line prefer-const
+      let [urlPath, urlQuery] = url?.split('?') || [];
+      let [referrerPath, referrerQuery] = referrer?.split('?') || [];
+      let referrerDomain;
+
+      if (!urlPath) {
+        urlPath = '/';
+      }
+
+      if (referrerPath?.startsWith('http')) {
+        const refUrl = new URL(referrer);
+        referrerPath = refUrl.pathname;
+        referrerQuery = refUrl.search.substring(1);
+        referrerDomain = refUrl.hostname.replace(/www\./, '');
+      }
+
+      if (process.env.REMOVE_TRAILING_SLASH) {
+        urlPath = urlPath.replace(/.+\/$/, '');
+      }
+
+      await saveEvent({
+        urlPath,
+        urlQuery,
+        referrerPath,
+        referrerQuery,
+        referrerDomain,
+        pageTitle,
+        eventName,
+        eventData,
+        ...session,
+        sessionId: session.id,
+      });
     }
 
-    await saveEvent({
-      urlPath,
-      urlQuery,
-      referrerPath,
-      referrerQuery,
-      referrerDomain,
-      pageTitle,
-      eventName,
-      eventData,
-      ...session,
-      sessionId: session.id,
-    });
+    if (type === COLLECTION_TYPE.identify) {
+      if (!eventData) {
+        return badRequest(res, 'Data required.');
+      }
+
+      await saveSessionData({ ...session, sessionData: eventData, sessionId: session.id });
+    }
+
+    const token = createToken(session, secret());
+
+    return send(res, token);
   }
 
-  if (type === COLLECTION_TYPE.identify) {
-    if (!eventData) {
-      return badRequest(res, 'Data required.');
-    }
-
-    await saveSessionData({ ...session, sessionData: eventData, sessionId: session.id });
-  }
-
-  const token = createToken(session, secret());
-
-  return send(res, token);
+  return methodNotAllowed(res);
 };
 
-async function hasBlockedIp(req: NextApiRequestCollect) {
+function hasBlockedIp(req: NextApiRequestCollect) {
   const ignoreIps = process.env.IGNORE_IP;
-  const ignoreHostnames = process.env.IGNORE_HOSTNAME;
 
-  if (ignoreIps || ignoreHostnames) {
+  if (ignoreIps) {
     const ips = [];
 
     if (ignoreIps) {
       ips.push(...ignoreIps.split(',').map(n => n.trim()));
-    }
-
-    if (ignoreHostnames) {
-      const resolver = new Resolver();
-      const promises = ignoreHostnames
-        .split(',')
-        .map(n => resolver.resolve4(n.trim()).catch(() => {}));
-
-      await Promise.all(promises).then(resolvedIps => {
-        ips.push(...resolvedIps.filter(n => n).flatMap(n => n as string[]));
-      });
     }
 
     const clientIp = getIpAddress(req);
@@ -174,8 +164,8 @@ async function hasBlockedIp(req: NextApiRequestCollect) {
 
         if (addr.kind() === range[0].kind() && addr.match(range)) return true;
       }
-
-      return false;
     });
   }
+
+  return false;
 }
